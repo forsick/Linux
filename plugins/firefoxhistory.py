@@ -468,3 +468,228 @@ class FireFoxDownloads(interfaces.plugins.PluginInterface):
             ], 
             self._generator()
         )
+    
+class FireFoxCookies(interfaces.plugins.PluginInterface):
+    """ Scans for and parses potential Firefox cookies (cookies.sqlite moz_cookies table"""
+    _required_framework_version = (2, 0, 0)
+
+    @classmethod
+    def get_requirements(cls):
+        return [
+            requirements.ModuleRequirement(
+                name="kernel", 
+                description="Memory layer for the kernel", 
+                architectures=["Intel32", "Intel64"]
+            ),
+            requirements.BooleanRequirement(
+                name="nulltime", 
+                description="Don't print entries with null timestamps", 
+                default=False, 
+                optional=True
+            ),
+        ]
+    
+    def _generator(self):
+        kernel = self.context.modules[self.config["kernel"]]
+        physical_layer_name = self.context.layers[kernel.layer_name].config.get(
+            "memory_layer", None
+        )
+        layer = self.context.layers[physical_layer_name]
+        needles=[
+                    b'\x04\x06\x06\x08',
+                    b'\x04\x06\x06\x09',
+                    b'\x05\x06\x06\x08',
+                    b'\x05\x06\x06\x09'
+                ]
+        cookies = {}
+
+        for offset, _value in layer.scan(
+            context=self.context,
+            scanner=scan.MultiStringScanner(patterns=needles),
+        ):
+            try:
+                ff_buff = layer.read(offset - 16, 4200)
+            except PagedInvalidAddressException as e:
+                print(f"Unable to read page at offset {offset}: {e}")
+                continue
+
+            start = 16
+            if (ff_buff[start+4] in (8,9)):
+                good = False
+            
+                # start before the needle match and work backwards to the first record payload length
+                start -= 1
+                (path_length, varint_len) = sqlite_help.find_varint(ff_buff, start, BACKWARD)
+                path_length = sqlite_help.varint_to_text_length(path_length)
+
+                start -= varint_len
+                (host_length, varint_len) = sqlite_help.find_varint(ff_buff, start, BACKWARD)
+                host_length = sqlite_help.varint_to_text_length(host_length)
+
+                start -= varint_len
+                (value_length, varint_len) = sqlite_help.find_varint(ff_buff, start, BACKWARD)
+                value_length = sqlite_help.varint_to_text_length(value_length)
+
+                start -= varint_len
+                (name_length, varint_len) = sqlite_help.find_varint(ff_buff, start, BACKWARD)
+                name_length = sqlite_help.varint_to_text_length(name_length)
+                start -= varint_len
+
+                # newer versions add appId and inBrowserElement, they are INTEGER type 
+                # so if they exist, they will both have length values less than 12
+                inBrowserElement_length = 0
+                inBrowserElement = "n/a"
+                appId_length = 0
+                appId = "n/a"
+                # if they don't exist, the previous value is a var int and could be something
+                # like 0x81 0x10, so wee need to check both bytes
+                if 0 < ff_buff[start] < 12 and 0 < ff_buff[start-1] < 12:
+                    (inBrowserElement_length, inBrowserElement) = sqlite_help.varint_type_to_length(ff_buff[start])
+                    (appId_length, appId) = sqlite_help.varint_type_to_length(ff_buff[start-1])
+                    start -= 2
+
+                (baseDomain_length, varint_len) = sqlite_help.find_varint(ff_buff, start, BACKWARD)
+                baseDomain_length = sqlite_help.varint_to_text_length(baseDomain_length)
+
+                start -= varint_len
+                (cookie_id_length, varint_len) = sqlite_help.find_varint(ff_buff, start, BACKWARD)
+
+                start -= varint_len
+                (payload_header_length, varint_len) = sqlite_help.find_varint(ff_buff, start, BACKWARD)
+
+                start -= varint_len
+                (row_id, varint_len) = sqlite_help.find_varint(ff_buff, start, BACKWARD)
+
+                start -= varint_len
+                (payload_length, varint_len) = sqlite_help.find_varint(ff_buff, start, BACKWARD)
+
+                # start of record reached, so jump back to the needle, then work forward
+                start = 16
+
+                (expiry_length, expiry) = sqlite_help.varint_type_to_length(ff_buff[start])
+                (lastAccessed_length, lastAccessed) = sqlite_help.varint_type_to_length(ff_buff[start+1])
+                (creationTime_length, creationTime) = sqlite_help.varint_type_to_length(ff_buff[start+2])
+                (isSecure_length, isSecure) = sqlite_help.varint_type_to_length(ff_buff[start+3])
+                (isHttpOnly_length, isHttpOnly) = sqlite_help.varint_type_to_length(ff_buff[start+4])
+
+                start += 5
+
+                cookie_id_length = int(cookie_id_length)
+                baseDomain_length = int(baseDomain_length)
+                inBrowserElement_length = int(inBrowserElement_length)
+                appId_length = int(appId_length)
+                name_length = int(name_length)
+                value_length = int(value_length)
+                host_length = int(host_length)
+                path_length = int(path_length)
+                expiry_length = int(expiry_length)
+                lastAccessed_length = int(lastAccessed_length)
+                creationTime_length = int(creationTime_length)
+                isSecure_length = int(isSecure_length)
+                isHttpOnly_length = int(isHttpOnly_length)
+
+                cookie_id = ff_buff[start:start+cookie_id_length]
+                cookie_id = sqlite_help.sql_unpack(cookie_id)
+
+                baseDomain = ff_buff[start:start+baseDomain_length]
+                start += baseDomain_length
+
+                # if the length is > 0, it will need to be set
+                # if it == 0, it was already set in the call earlier
+                # otherwise, the value should be "n/a" from initialization because it's an older version
+                if inBrowserElement_length > 0:
+                    inBrowserElement = ff_buff[start:start+inBrowserElement_length]
+                    inBrowserElement = sqlite_help.sql_unpack(inBrowserElement)
+                start += inBrowserElement_length
+                    
+                if appId_length > 0:
+                    appID = ff_buff[start:start+appId_length]
+                    appId = sqlite_help.sql_unpack(appId)
+                start += appId_length
+
+                name = ff_buff[start:start+name_length]
+                start += name_length
+                name = name.decode('utf-8', errors='ignore')
+
+                value = ff_buff[start:start+value_length]
+                start += value_length
+                value = value.decode('utf-8', errors='ignore')
+
+                host = ff_buff[start:start+host_length]
+                start += host_length
+                host = host.decode('utf-8', errors='ignore')
+
+                path = ff_buff[start:start+path_length]
+                start += path_length
+                path = path.decode('utf-8', errors='ignore')
+
+                # get the 3 time fields and do a check that a valid date is returned
+                expiry = ff_buff[start:start+expiry_length]
+                expiry = sqlite_help.sql_unpack(expiry)
+                if str(expiry) > str(0) and expiry:
+                    expiry = sqlite_help.get_nixtime_from_sec(expiry)
+                if type(expiry) is not datetime:
+                    continue
+                start += expiry_length
+
+                lastAccessed = ff_buff[start:start+lastAccessed_length]
+                lastAccessed = sqlite_help.sql_unpack(lastAccessed)
+                if lastAccessed > 0 and lastAccessed:
+                    lastAccessed = sqlite_help.get_nixtime_from_msec(lastAccessed)
+                if type(lastAccessed) is not datetime:
+                    continue
+                start += lastAccessed_length
+
+                creationTime = ff_buff[start:start+creationTime_length]
+                creationTime = sqlite_help.sql_unpack(creationTime)
+                if creationTime > 0 and creationTime:
+                    creationTime = sqlite_help.get_nixtime_from_msec(creationTime)
+                if type(creationTime) is not datetime:
+                    continue
+                start += creationTime_length
+
+                # if all 3 dates are 1970, it's likely a garbage record, so skip
+                # if any of them are real dates, it could be an old or partially overwritten record, so print
+                if expiry.year == 1970 and lastAccessed.year == 1970 and creationTime.year ==1970:
+                    continue
+
+                if isSecure_length > 0:
+                    isSecure = ff_buff[start:start+isSecure_length]
+                    isSecure = sqlite_help.sql_unpack(isSecure)
+                start += isSecure_length
+                isSecure = isSecure.decode('utf-8', errors='ignore')
+                
+                if isHttpOnly_length > 0:
+                    isHttpOnly = ff_buff[start:start+isHttpOnly_length]
+                    isHttpOnly = sqlite_help.sql_unpack(isHttpOnly)
+                start += isHttpOnly_length
+                isHttpOnly = isHttpOnly.decode('utf-8', errors='ignore')
+
+                cookies[int(offset)] = (int(row_id), str(baseDomain), str(appID), str(inBrowserElement), str(name), str(value), str(host), str(path), str(expiry), str(lastAccessed), str(creationTime), str(isSecure), str(isHttpOnly))
+                    
+                # add all fields to the tuple so we only print unique records once
+            seen_tuples = set()
+            for value in cookies.values():
+                if value not in seen_tuples:
+                    seen_tuples.add(value)
+                    yield 0, (value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7], value[8], value[9], value[10], value[11], value[12])
+    
+    def run(self):
+        return renderers.TreeGrid(
+            [
+                ("Row ID", int), 
+                ("Base Domain", str), 
+                ("App ID", str), 
+                ("InBrowserElement", str),
+                ("Name", str), 
+                ("Value", str),
+                ("Host", str),
+                ("Path", str),
+                ("Expiry", str), 
+                ("Last Accessed", str), 
+                ("Creation Time", str), 
+                ("Secure", str),
+                ("HttpOnly", str)
+            ], 
+            self._generator()
+        )
